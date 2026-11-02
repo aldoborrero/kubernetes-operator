@@ -520,6 +520,119 @@ var _ = Describe("NBRoutingPeer Controller", func() {
 								Expect(k8sClient.Get(ctx, typeNamespacedName, secret)).To(Succeed())
 								Expect(secret.Data).To(HaveKey("setupKey"))
 								Expect(secret.Data["setupKey"]).To(BeEquivalentTo([]byte("SuperSecretKey")))
+								Expect(secret.Annotations).To(HaveKeyWithValue(setupKeyIDAnnotation, "test"))
+
+								Expect(k8sClient.Get(ctx, typeNamespacedName, nbroutingpeer)).To(Succeed())
+								Expect(nbroutingpeer.Status.SetupKeyID).To(BeEquivalentTo(new("test")))
+							})
+						})
+						When("Status lost its setup key but the Secret holds a valid one", func() {
+							It("should reuse that key instead of creating another", func() {
+								secret := &corev1.Secret{
+									ObjectMeta: metav1.ObjectMeta{
+										Namespace:   typeNamespacedName.Namespace,
+										Name:        typeNamespacedName.Name,
+										Annotations: map[string]string{setupKeyIDAnnotation: "kept"},
+									},
+									Data: map[string][]byte{
+										"setupKey": []byte("SuperSecretKey"),
+									},
+								}
+								Expect(k8sClient.Create(ctx, secret)).To(Succeed())
+
+								setupKeyCreated := false
+								mux.HandleFunc("/api/setup-keys", func(w http.ResponseWriter, r *http.Request) {
+									if r.Method == http.MethodPost {
+										setupKeyCreated = true
+									}
+									w.WriteHeader(http.StatusInternalServerError)
+								})
+								mux.HandleFunc("/api/setup-keys/kept", func(w http.ResponseWriter, r *http.Request) {
+									defer GinkgoRecover()
+									Expect(r.Method).To(Equal(http.MethodGet))
+									resp := api.SetupKey{
+										Id:    "kept",
+										Key:   "Super****",
+										State: "valid",
+										Valid: true,
+									}
+									bs, err := json.Marshal(resp)
+									Expect(err).NotTo(HaveOccurred())
+									_, err = w.Write(bs)
+									Expect(err).NotTo(HaveOccurred())
+								})
+
+								_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+									NamespacedName: typeNamespacedName,
+								})
+								Expect(err).NotTo(HaveOccurred())
+								Expect(setupKeyCreated).To(BeFalse())
+
+								Expect(k8sClient.Get(ctx, typeNamespacedName, nbroutingpeer)).To(Succeed())
+								Expect(nbroutingpeer.Status.SetupKeyID).To(BeEquivalentTo(new("kept")))
+							})
+						})
+						When("Status lost its setup key and the Secret holds an unusable one", func() {
+							It("should create a new key and delete the one it replaces", func() {
+								secret := &corev1.Secret{
+									ObjectMeta: metav1.ObjectMeta{
+										Namespace:   typeNamespacedName.Namespace,
+										Name:        typeNamespacedName.Name,
+										Annotations: map[string]string{setupKeyIDAnnotation: "old"},
+									},
+									Data: map[string][]byte{
+										"setupKey": []byte("OldSecretKey"),
+									},
+								}
+								Expect(k8sClient.Create(ctx, secret)).To(Succeed())
+
+								mux.HandleFunc("/api/setup-keys", func(w http.ResponseWriter, r *http.Request) {
+									defer GinkgoRecover()
+									Expect(r.Method).To(Equal(http.MethodPost))
+									resp := api.SetupKeyClear{
+										Id:    "test",
+										Key:   "SuperSecretKey",
+										Name:  controllerReconciler.ClusterName,
+										Valid: true,
+									}
+									bs, err := json.Marshal(resp)
+									Expect(err).NotTo(HaveOccurred())
+									_, err = w.Write(bs)
+									Expect(err).NotTo(HaveOccurred())
+								})
+								oldDeleted := false
+								mux.HandleFunc("/api/setup-keys/old", func(w http.ResponseWriter, r *http.Request) {
+									defer GinkgoRecover()
+									switch r.Method {
+									case http.MethodGet:
+										resp := api.SetupKey{
+											Id:    "old",
+											Key:   "OldSe****",
+											State: "expired",
+										}
+										bs, err := json.Marshal(resp)
+										Expect(err).NotTo(HaveOccurred())
+										_, err = w.Write(bs)
+										Expect(err).NotTo(HaveOccurred())
+									case http.MethodDelete:
+										oldDeleted = true
+										_, err := w.Write([]byte("{}"))
+										Expect(err).NotTo(HaveOccurred())
+									}
+								})
+
+								_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+									NamespacedName: typeNamespacedName,
+								})
+								Expect(err).NotTo(HaveOccurred())
+								Expect(oldDeleted).To(BeTrue())
+
+								Expect(k8sClient.Get(ctx, typeNamespacedName, secret)).To(Succeed())
+								Expect(secret.Data["setupKey"]).To(BeEquivalentTo([]byte("SuperSecretKey")))
+								Expect(secret.Annotations).To(HaveKeyWithValue(setupKeyIDAnnotation, "test"))
+
+								Expect(k8sClient.Get(ctx, typeNamespacedName, nbroutingpeer)).To(Succeed())
+								Expect(nbroutingpeer.Status.SetupKeyID).To(BeEquivalentTo(new("test")))
 							})
 						})
 						When("Setup key exists but secret is invalid", func() {

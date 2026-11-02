@@ -348,6 +348,19 @@ func (r *NBRoutingPeerReconciler) handleSetupKey(ctx context.Context, req ctrl.R
 
 	// Check if setup key exists
 	if nbrp.Status.SetupKeyID == nil {
+		// The status can be lost while the Secret survives (a failed status update, a
+		// restored or re-adopted resource). Reuse the key the Secret still carries instead
+		// of minting another one.
+		adopted, err := r.adoptSetupKey(ctx, req, logger)
+		if err != nil {
+			nbrp.Status.Conditions = nbv1.NBConditionFalse("APIError", fmt.Sprintf("error checking existing setup key: %v", err))
+			return &ctrl.Result{}, err
+		}
+		if adopted != "" {
+			nbrp.Status.SetupKeyID = &adopted
+			return nil, nil
+		}
+
 		// Create new setup key with group Status.GroupID
 		setupKey, err := r.Netbird.SetupKeys.Create(ctx, api.CreateSetupKeyRequest{
 			AutoGroups: []string{*nbGroup.Status.GroupID},
@@ -364,6 +377,18 @@ func (r *NBRoutingPeerReconciler) handleSetupKey(ctx context.Context, req ctrl.R
 
 		nbrp.Status.SetupKeyID = &setupKey.Id
 
+		// Record the ID now rather than in the deferred status update, which only logs a
+		// failure: a key whose ID is never recorded is never deleted, and the next reconcile
+		// creates another one.
+		if err = r.Client.Status().Update(ctx, nbrp); err != nil {
+			logger.Error(errKubernetesAPI, "error recording setup key ID", "err", err)
+			if delErr := r.Netbird.SetupKeys.Delete(ctx, setupKey.Id); delErr != nil && !netbird.IsNotFound(delErr) {
+				logger.Error(errNetBirdAPI, "error deleting unrecorded setup key", "id", setupKey.Id, "err", delErr)
+			}
+			nbrp.Status.SetupKeyID = nil
+			return &ctrl.Result{}, err
+		}
+
 		skSecret := corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      nbrp.Name,
@@ -377,12 +402,14 @@ func (r *NBRoutingPeerReconciler) handleSetupKey(ctx context.Context, req ctrl.R
 						BlockOwnerDeletion: new(true),
 					},
 				},
-				Labels: r.DefaultLabels,
+				Labels:      r.DefaultLabels,
+				Annotations: map[string]string{setupKeyIDAnnotation: setupKey.Id},
 			},
 			StringData: map[string]string{
 				"setupKey": setupKey.Key,
 			},
 		}
+		previousID := ""
 		err = r.Client.Create(ctx, &skSecret)
 		if errors.IsAlreadyExists(err) {
 			err = r.Client.Get(ctx, req.NamespacedName, &skSecret)
@@ -390,6 +417,11 @@ func (r *NBRoutingPeerReconciler) handleSetupKey(ctx context.Context, req ctrl.R
 				logger.Error(errNetBirdAPI, "error getting secret", "err", err)
 				return &ctrl.Result{}, err
 			}
+			previousID = skSecret.Annotations[setupKeyIDAnnotation]
+			if skSecret.Annotations == nil {
+				skSecret.Annotations = map[string]string{}
+			}
+			skSecret.Annotations[setupKeyIDAnnotation] = setupKey.Id
 			skSecret.Data = map[string][]byte{
 				"setupKey": []byte(setupKey.Key),
 			}
@@ -400,6 +432,16 @@ func (r *NBRoutingPeerReconciler) handleSetupKey(ctx context.Context, req ctrl.R
 			logger.Error(errKubernetesAPI, "error creating Secret", "err", err)
 			nbrp.Status.Conditions = nbv1.NBConditionFalse("internalError", fmt.Sprintf("error creating secret: %v", err))
 			return &ctrl.Result{}, err
+		}
+
+		// The Secret no longer carries the previous key, so nothing can use it: delete it.
+		if previousID != "" && previousID != setupKey.Id {
+			err = r.Netbird.SetupKeys.Delete(ctx, previousID)
+			if err != nil && !netbird.IsNotFound(err) {
+				logger.Error(errNetBirdAPI, "error deleting replaced setup key", "id", previousID, "err", err)
+				nbrp.Status.Conditions = nbv1.NBConditionFalse("APIError", fmt.Sprintf("error deleting replaced setup key: %v", err))
+				return &ctrl.Result{}, err
+			}
 		}
 	} else {
 		// Check SetupKey is not revoked
@@ -455,6 +497,45 @@ func (r *NBRoutingPeerReconciler) handleSetupKey(ctx context.Context, req ctrl.R
 	}
 
 	return nil, nil
+}
+
+// setupKeyIDAnnotation records, on the routing peer's Secret, the ID of the setup key whose
+// value the Secret holds. It survives a lost NBRoutingPeer status, so the key can be reused or
+// deleted instead of orphaned.
+const setupKeyIDAnnotation = "netbird.io/setup-key-id"
+
+// adoptSetupKey returns the ID of the setup key recorded on the routing peer's Secret when
+// NetBird still holds it as a valid key whose value matches the Secret, or "" otherwise.
+func (r *NBRoutingPeerReconciler) adoptSetupKey(ctx context.Context, req ctrl.Request, logger logr.Logger) (string, error) {
+	skSecret := corev1.Secret{}
+	err := r.Client.Get(ctx, req.NamespacedName, &skSecret)
+	if errors.IsNotFound(err) {
+		return "", nil
+	}
+	if err != nil {
+		logger.Error(errKubernetesAPI, "error getting Secret", "err", err)
+		return "", err
+	}
+	id := skSecret.Annotations[setupKeyIDAnnotation]
+	value := string(skSecret.Data["setupKey"])
+	if id == "" || len(value) < 5 {
+		return "", nil
+	}
+
+	setupKey, err := r.Netbird.SetupKeys.Get(ctx, id)
+	if netbird.IsNotFound(err) {
+		return "", nil
+	}
+	if err != nil {
+		logger.Error(errNetBirdAPI, "error getting setup key", "err", err)
+		return "", err
+	}
+	// NetBird returns the key masked except for its first characters.
+	if setupKey.Revoked || setupKey.State != "valid" || len(setupKey.Key) < 5 || setupKey.Key[:5] != value[:5] {
+		return "", nil
+	}
+	logger.Info("Reusing the setup key recorded on the Secret", "id", id)
+	return id, nil
 }
 
 // handleGroup creates/updates NBGroup for routing peer
