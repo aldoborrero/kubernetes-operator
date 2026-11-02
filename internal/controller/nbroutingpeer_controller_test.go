@@ -5,9 +5,11 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 
 	"github.com/go-logr/logr"
 	. "github.com/onsi/ginkgo/v2"
@@ -570,6 +572,64 @@ var _ = Describe("NBRoutingPeer Controller", func() {
 
 								Expect(k8sClient.Get(ctx, typeNamespacedName, nbroutingpeer)).To(Succeed())
 								Expect(nbroutingpeer.Status.SetupKeyID).To(BeEquivalentTo(new("kept")))
+							})
+						})
+						When("Recording the new setup key ID conflicts", func() {
+							It("should not leave the key it created behind", func() {
+								created := []string{}
+								deleted := []string{}
+								mux.HandleFunc("/api/setup-keys", func(w http.ResponseWriter, r *http.Request) {
+									defer GinkgoRecover()
+									Expect(r.Method).To(Equal(http.MethodPost))
+									id := fmt.Sprintf("key-%d", len(created))
+									if len(created) == 0 {
+										// Someone else writes the NBRoutingPeer while the key is
+										// being created, so the reconciler's copy is now stale.
+										latest := &nbv1.NBRoutingPeer{}
+										Expect(k8sClient.Get(ctx, typeNamespacedName, latest)).To(Succeed())
+										latest.Labels = map[string]string{"bump": "1"}
+										Expect(k8sClient.Update(ctx, latest)).To(Succeed())
+									}
+									created = append(created, id)
+									resp := api.SetupKeyClear{Id: id, Key: "SuperSecretKey", Valid: true}
+									bs, err := json.Marshal(resp)
+									Expect(err).NotTo(HaveOccurred())
+									_, err = w.Write(bs)
+									Expect(err).NotTo(HaveOccurred())
+								})
+								mux.HandleFunc("/api/setup-keys/", func(w http.ResponseWriter, r *http.Request) {
+									defer GinkgoRecover()
+									id := r.URL.Path[len("/api/setup-keys/"):]
+									switch r.Method {
+									case http.MethodDelete:
+										deleted = append(deleted, id)
+										_, err := w.Write([]byte("{}"))
+										Expect(err).NotTo(HaveOccurred())
+									case http.MethodGet:
+										resp := api.SetupKey{Id: id, Key: "Super****", State: "valid", Valid: true}
+										bs, err := json.Marshal(resp)
+										Expect(err).NotTo(HaveOccurred())
+										_, err = w.Write(bs)
+										Expect(err).NotTo(HaveOccurred())
+									}
+								})
+
+								for range 3 {
+									_, _ = controllerReconciler.Reconcile(ctx, reconcile.Request{
+										NamespacedName: typeNamespacedName,
+									})
+								}
+
+								Expect(k8sClient.Get(ctx, typeNamespacedName, nbroutingpeer)).To(Succeed())
+								Expect(nbroutingpeer.Status.SetupKeyID).NotTo(BeNil())
+								// Every key created is either the one recorded or deleted.
+								live := []string{}
+								for _, id := range created {
+									if !slices.Contains(deleted, id) {
+										live = append(live, id)
+									}
+								}
+								Expect(live).To(ConsistOf(*nbroutingpeer.Status.SetupKeyID))
 							})
 						})
 						When("Status lost its setup key and the Secret holds an unusable one", func() {
