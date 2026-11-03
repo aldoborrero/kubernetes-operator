@@ -494,6 +494,22 @@ func (r *NBRoutingPeerReconciler) handleSetupKey(ctx context.Context, req ctrl.R
 			// Requeue to avoid repeating code
 			return &ctrl.Result{Requeue: true}, nil
 		}
+
+		// The status names a key the Secret never received (the Secret write failed after
+		// the status was recorded), so no routing peer can be using it: they read the
+		// Secret's key. Delete the status key and requeue; the next pass reuses the Secret's.
+		if recorded := skSecret.Annotations[setupKeyIDAnnotation]; recorded != "" && recorded != *nbrp.Status.SetupKeyID {
+			logger.Info("Status setup key differs from the Secret's, deleting it", "status", *nbrp.Status.SetupKeyID, "secret", recorded)
+			err = r.Netbird.SetupKeys.Delete(ctx, *nbrp.Status.SetupKeyID)
+			if err != nil && !netbird.IsNotFound(err) {
+				logger.Error(errNetBirdAPI, "error deleting setup key", "err", err)
+				nbrp.Status.Conditions = nbv1.NBConditionFalse("APIError", fmt.Sprintf("error deleting setup key: %v", err))
+				return &ctrl.Result{}, err
+			}
+
+			nbrp.Status.SetupKeyID = nil
+			return &ctrl.Result{Requeue: true}, nil
+		}
 	}
 
 	return nil, nil
