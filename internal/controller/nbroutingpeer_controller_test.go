@@ -574,6 +574,62 @@ var _ = Describe("NBRoutingPeer Controller", func() {
 								Expect(nbroutingpeer.Status.SetupKeyID).To(BeEquivalentTo(new("kept")))
 							})
 						})
+						When("The status names a different key than the Secret holds", func() {
+							It("should delete the status key and reuse the Secret's", func() {
+								nbroutingpeer.Status.SetupKeyID = new("stale")
+								Expect(k8sClient.Status().Update(ctx, nbroutingpeer)).To(Succeed())
+								secret := &corev1.Secret{
+									ObjectMeta: metav1.ObjectMeta{
+										Namespace:   typeNamespacedName.Namespace,
+										Name:        typeNamespacedName.Name,
+										Annotations: map[string]string{setupKeyIDAnnotation: "kept"},
+									},
+									Data: map[string][]byte{
+										"setupKey": []byte("SuperSecretKey"),
+									},
+								}
+								Expect(k8sClient.Create(ctx, secret)).To(Succeed())
+
+								created := false
+								deleted := []string{}
+								mux.HandleFunc("/api/setup-keys", func(w http.ResponseWriter, r *http.Request) {
+									created = true
+									w.WriteHeader(http.StatusInternalServerError)
+								})
+								mux.HandleFunc("/api/setup-keys/", func(w http.ResponseWriter, r *http.Request) {
+									defer GinkgoRecover()
+									id := r.URL.Path[len("/api/setup-keys/"):]
+									switch r.Method {
+									case http.MethodDelete:
+										deleted = append(deleted, id)
+										_, err := w.Write([]byte("{}"))
+										Expect(err).NotTo(HaveOccurred())
+									case http.MethodGet:
+										if slices.Contains(deleted, id) {
+											w.WriteHeader(http.StatusNotFound)
+											return
+										}
+										resp := api.SetupKey{Id: id, Key: "Super****", State: "valid", Valid: true}
+										bs, err := json.Marshal(resp)
+										Expect(err).NotTo(HaveOccurred())
+										_, err = w.Write(bs)
+										Expect(err).NotTo(HaveOccurred())
+									}
+								})
+
+								for range 2 {
+									_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+										NamespacedName: typeNamespacedName,
+									})
+									Expect(err).NotTo(HaveOccurred())
+								}
+
+								Expect(created).To(BeFalse())
+								Expect(deleted).To(ConsistOf("stale"))
+								Expect(k8sClient.Get(ctx, typeNamespacedName, nbroutingpeer)).To(Succeed())
+								Expect(nbroutingpeer.Status.SetupKeyID).To(BeEquivalentTo(new("kept")))
+							})
+						})
 						When("Recording the new setup key ID conflicts", func() {
 							It("should not leave the key it created behind", func() {
 								created := []string{}
