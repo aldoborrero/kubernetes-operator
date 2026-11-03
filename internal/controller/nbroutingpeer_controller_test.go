@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"time"
 
 	"github.com/go-logr/logr"
 	. "github.com/onsi/ginkgo/v2"
@@ -808,6 +809,47 @@ var _ = Describe("NBRoutingPeer Controller", func() {
 								Expect(k8sClient.Get(ctx, typeNamespacedName, secret)).To(Succeed())
 								Expect(secret.Data).To(HaveKey("setupKey"))
 								Expect(secret.Data["setupKey"]).To(BeEquivalentTo([]byte("OriginalKey")))
+							})
+							It("should not rewrite an unchanged status", func() {
+								mux.HandleFunc("/api/setup-keys/skid", func(w http.ResponseWriter, r *http.Request) {
+									defer GinkgoRecover()
+									bs, err := json.Marshal(api.SetupKey{Id: "skid"})
+									Expect(err).NotTo(HaveOccurred())
+									_, err = w.Write(bs)
+									Expect(err).NotTo(HaveOccurred())
+								})
+
+								nbroutingpeer.Status.SetupKeyID = new("skid")
+								Expect(k8sClient.Status().Update(ctx, nbroutingpeer)).To(Succeed())
+								secret := &corev1.Secret{
+									ObjectMeta: metav1.ObjectMeta{
+										Namespace: typeNamespacedName.Namespace,
+										Name:      typeNamespacedName.Name,
+									},
+									StringData: map[string]string{
+										"setupKey": "OriginalKey",
+									},
+								}
+								Expect(k8sClient.Create(ctx, secret)).To(Succeed())
+
+								_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+								Expect(err).NotTo(HaveOccurred())
+								Expect(k8sClient.Get(ctx, typeNamespacedName, nbroutingpeer)).To(Succeed())
+								Expect(nbroutingpeer.Status.Conditions).To(HaveLen(1))
+								Expect(nbroutingpeer.Status.Conditions[0].Status).To(Equal(corev1.ConditionTrue))
+								resourceVersion := nbroutingpeer.ResourceVersion
+								first := nbroutingpeer.Status.Conditions[0]
+
+								// Condition times have second precision, so a rewrite only changes the
+								// object, and triggers the next reconcile, once a second has passed.
+								time.Sleep(1100 * time.Millisecond)
+
+								_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+								Expect(err).NotTo(HaveOccurred())
+								Expect(k8sClient.Get(ctx, typeNamespacedName, nbroutingpeer)).To(Succeed())
+								Expect(nbroutingpeer.ResourceVersion).To(Equal(resourceVersion), "unchanged status should not be written")
+								Expect(nbroutingpeer.Status.Conditions[0].LastProbeTime).To(Equal(first.LastProbeTime), "probe time should not be restamped")
+								Expect(nbroutingpeer.Status.Conditions[0].LastTransitionTime).To(Equal(first.LastTransitionTime), "transition time should not be restamped")
 							})
 						})
 					})

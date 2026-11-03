@@ -5,6 +5,7 @@ package v1
 import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 
 	"github.com/netbirdio/kubernetes-operator/internal/util"
 )
@@ -43,12 +44,14 @@ type NBRoutingPeerStatus struct {
 	Conditions []NBCondition `json:"conditions,omitempty"`
 }
 
-// Equal returns if NBRoutingPeerStatus is equal to this one
+// Equal returns if NBRoutingPeerStatus is equal to this one. Condition timestamps are
+// ignored, since they are restamped on every reconcile and writing them alone would
+// trigger the next reconcile.
 func (a NBRoutingPeerStatus) Equal(b NBRoutingPeerStatus) bool {
-	return a.NetworkID == b.NetworkID &&
-		a.SetupKeyID == b.SetupKeyID &&
-		a.RouterID == b.RouterID &&
-		util.Equivalent(a.Conditions, b.Conditions)
+	return ptr.Equal(a.NetworkID, b.NetworkID) &&
+		ptr.Equal(a.SetupKeyID, b.SetupKeyID) &&
+		ptr.Equal(a.RouterID, b.RouterID) &&
+		util.Equivalent(withoutConditionTimes(a.Conditions), withoutConditionTimes(b.Conditions))
 }
 
 // +kubebuilder:object:root=true
