@@ -4,6 +4,7 @@ package v1
 
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 
 	"github.com/netbirdio/kubernetes-operator/internal/util"
 )
@@ -23,9 +24,12 @@ type NBGroupStatus struct {
 	Conditions []NBCondition `json:"conditions,omitempty"`
 }
 
-// Equal returns if NBGroupStatus is equal to this one
+// Equal returns if NBGroupStatus is equal to this one. Condition timestamps are
+// ignored, since they are restamped on every reconcile and writing them alone would
+// trigger the next reconcile.
 func (a NBGroupStatus) Equal(b NBGroupStatus) bool {
-	return (a.GroupID == b.GroupID || (a.GroupID != nil && b.GroupID != nil && *a.GroupID == *b.GroupID)) && util.Equivalent(a.Conditions, b.Conditions)
+	return ptr.Equal(a.GroupID, b.GroupID) &&
+		util.Equivalent(withoutConditionTimes(a.Conditions), withoutConditionTimes(b.Conditions))
 }
 
 // +kubebuilder:object:root=true

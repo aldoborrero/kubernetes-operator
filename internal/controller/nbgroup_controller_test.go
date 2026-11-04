@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -152,6 +153,40 @@ var _ = Describe("NBGroup Controller", func() {
 				Expect(nbGroup.Status.Conditions).To(HaveLen(1))
 				Expect(nbGroup.Status.Conditions[0].Status).To(BeEquivalentTo(metav1.ConditionTrue))
 				Expect(nbGroup.Status.Conditions[0].Type).To(Equal(nbv1.NBSetupKeyReady))
+			})
+		})
+
+		When("Nothing changed since the last reconcile", func() {
+			It("should keep the status and its condition timestamps", func() {
+				controllerReconciler := &NBGroupReconciler{
+					Client:  k8sClient,
+					Netbird: netbirdClient,
+				}
+
+				mux.HandleFunc("/api/groups", func(w http.ResponseWriter, r *http.Request) {
+					bs, err := json.Marshal([]api.Group{{Id: "Test", Name: resourceName}})
+					Expect(err).NotTo(HaveOccurred())
+					_, err = w.Write(bs)
+					Expect(err).NotTo(HaveOccurred())
+				})
+
+				_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+				Expect(err).NotTo(HaveOccurred())
+				Expect(k8sClient.Get(ctx, typeNamespacedName, &nbGroup)).To(Succeed())
+				Expect(nbGroup.Status.Conditions).To(HaveLen(1))
+				resourceVersion := nbGroup.ResourceVersion
+				first := nbGroup.Status.Conditions[0]
+
+				// Condition times have second precision, so a rewrite only changes the
+				// object, and triggers the next reconcile, once a second has passed.
+				time.Sleep(1100 * time.Millisecond)
+
+				_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+				Expect(err).NotTo(HaveOccurred())
+				Expect(k8sClient.Get(ctx, typeNamespacedName, &nbGroup)).To(Succeed())
+				Expect(nbGroup.ResourceVersion).To(Equal(resourceVersion), "unchanged status should not be written")
+				Expect(nbGroup.Status.Conditions[0].LastProbeTime).To(Equal(first.LastProbeTime), "probe time should not be restamped")
+				Expect(nbGroup.Status.Conditions[0].LastTransitionTime).To(Equal(first.LastTransitionTime), "transition time should not be restamped")
 			})
 		})
 
