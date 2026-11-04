@@ -6,6 +6,7 @@ import (
 	"maps"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 
 	"github.com/netbirdio/kubernetes-operator/internal/util"
 )
@@ -66,14 +67,16 @@ type NBResourceStatus struct {
 	PolicyNameMapping map[string]string `json:"policyNameMapping"`
 }
 
-// Equal returns if NBResourceStatus is equal to this one
+// Equal returns if NBResourceStatus is equal to this one. Condition timestamps are
+// ignored, since they are restamped on every reconcile and writing them alone would
+// trigger the next reconcile.
 func (a NBResourceStatus) Equal(b NBResourceStatus) bool {
-	return a.NetworkResourceID == b.NetworkResourceID &&
-		a.PolicyName == b.PolicyName &&
+	return ptr.Equal(a.NetworkResourceID, b.NetworkResourceID) &&
+		ptr.Equal(a.PolicyName, b.PolicyName) &&
 		util.Equivalent(a.TCPPorts, b.TCPPorts) &&
 		util.Equivalent(a.UDPPorts, b.UDPPorts) &&
 		util.Equivalent(a.Groups, b.Groups) &&
-		util.Equivalent(a.Conditions, b.Conditions) &&
+		util.Equivalent(withoutConditionTimes(a.Conditions), withoutConditionTimes(b.Conditions)) &&
 		util.Equivalent(a.PolicySourceGroups, b.PolicySourceGroups) &&
 		maps.Equal(a.PolicyFriendlyName, b.PolicyFriendlyName) &&
 		maps.Equal(a.PolicyNameMapping, b.PolicyNameMapping)
